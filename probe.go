@@ -172,8 +172,6 @@ type Probe struct {
 	// tcObject - (TC classifier) TC object created when the classifier was attached. It will be reused to delete it on
 	// exit.
 	tcObject *tc.Object
-
-	UnwindStack bool
 }
 
 // Copy - Returns a copy of the current probe instance. Only the exported fields are copied.
@@ -621,7 +619,7 @@ func (p *Probe) attachTracepoint() error {
 	category := traceGroup[1]
 	name := traceGroup[2]
 
-	kp, err := link.Tracepoint(category, name, p.program, nil, p.UnwindStack)
+	kp, err := link.Tracepoint(category, name, p.program, nil)
 	if err != nil {
 		return errors.New(fmt.Sprintf("error:%v , couldn's activate tracepoint %s, matchFuncName:%s", err, p.Section, p.EbpfFuncName))
 	}
@@ -654,9 +652,8 @@ func (p *Probe) attachUprobe() error {
 		return errors.New(fmt.Sprintf("error:%v , couldn't enable uprobe %s", err, p.EbpfFuncName))
 	}
 	opts := &link.UprobeOptions{
-		Offset:      p.UprobeOffset,
-		PID:         p.AttachPID,
-		UnwindStack: p.UnwindStack,
+		Offset: p.UprobeOffset,
+		PID:    p.AttachPID,
 	}
 
 	var kp link.Link
