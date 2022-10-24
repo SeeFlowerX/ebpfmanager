@@ -654,8 +654,9 @@ func (p *Probe) attachUprobe() error {
 		return errors.New(fmt.Sprintf("error:%v , couldn't enable uprobe %s", err, p.EbpfFuncName))
 	}
 	opts := &link.UprobeOptions{
-		Offset: p.UprobeOffset,
-		PID:    p.AttachPID,
+		Offset:      p.UprobeOffset,
+		PID:         p.AttachPID,
+		UnwindStack: p.UnwindStack,
 	}
 
 	var kp link.Link
