@@ -642,18 +642,17 @@ func (p *Probe) attachUprobe() error {
 		return fmt.Errorf("error:%v, program type unrecognized in section %v", ErrSectionFormat, p.Section)
 	}
 
-	// compute the offset if it was not provided
-	if p.UprobeOffset == 0 {
-		p.funcName = p.AttachToFuncName
-	}
+	// cilium/ebpf新版中不管怎么样都需要一个符号名 不然写入uprobe_events有问题
+	p.funcName = p.AttachToFuncName
 
 	ex, err := link.OpenExecutable(p.BinaryPath)
 	if err != nil {
 		return errors.New(fmt.Sprintf("error:%v , couldn't enable uprobe %s", err, p.EbpfFuncName))
 	}
+	// cilium/ebpf最新版中应当使用Address
 	opts := &link.UprobeOptions{
-		Offset: p.UprobeOffset,
-		PID:    p.AttachPID,
+		Address: p.UprobeOffset,
+		PID:     p.AttachPID,
 	}
 
 	var kp link.Link
