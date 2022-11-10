@@ -143,7 +143,7 @@ func (m *PerfMap) Start() error {
 	opt := perf.ReaderOptions{
 		Watermark: m.Watermark,
 	}
-	if m.perfReader, err = perf.NewReaderWithOptions(m.array, m.PerfRingBufferSize, opt, false); err != nil {
+	if m.perfReader, err = perf.NewReaderWithOptions(m.array, m.PerfRingBufferSize, opt, false, false); err != nil {
 		return err
 	}
 
