@@ -5,13 +5,13 @@ import (
 	"debug/elf"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type state uint
@@ -22,10 +22,14 @@ const (
 	paused
 	running
 
-	// MaxEventNameLen - maximum length for a kprobe (or uprobe) event name
+	// maxEventNameLen - maximum length for a kprobe (or uprobe) event name
 	// MAX_EVENT_NAME_LEN (linux/kernel/trace/trace.h)
-	MaxEventNameLen    = 64
-	MinFunctionNameLen = 10
+	maxEventNameLen    = 64
+	minFunctionNameLen = 10
+
+	// maxBPFClassifierNameLen - maximum length for a TC
+	// CLS_BPF_NAME_LEN (linux/net/sched/cls_bpf.c)
+	maxBPFClassifierNameLen = 256
 )
 
 // ConcatErrors - Concatenate 2 errors into one error.
@@ -51,7 +55,7 @@ func FindFilterFunction(funcName string) (string, error) {
 
 	// Cache available filter functions if necessary
 	if len(availableFilterFunctions) == 0 {
-		funcs, err := ioutil.ReadFile("/sys/kernel/debug/tracing/available_filter_functions")
+		funcs, err := os.ReadFile("/sys/kernel/debug/tracing/available_filter_functions")
 		if err != nil {
 			return "", err
 		}
@@ -93,6 +97,7 @@ func GetSyscallFnName(name string) (string, error) {
 
 // cache of the symfile
 var kallsymsCache = make(map[string]bool)
+var kallSymsLocker = sync.Mutex{}
 
 // GetSyscallFnNameWithSymFile - Returns the kernel function of the provided syscall, after reading symFile to retrieve
 // the list of symbols of the current kernel.
@@ -118,12 +123,18 @@ func GetSyscallFnNameWithSymFile(name string, symFile string) (string, error) {
 			// only save symbol in text (code) section and weak symbol
 			// Reference: https://github.com/iovisor/bcc/pull/1540/files
 			if strings.ToLower(line[1]) == "t" || strings.ToLower(line[1]) == "w" {
+				kallSymsLocker.Lock()
 				kallsymsCache[line[2]] = true
+				kallSymsLocker.Unlock()
 			}
 		}
 	}
 
-	if _, exist := kallsymsCache[name]; exist {
+	kallSymsLocker.Lock()
+	_, exist := kallsymsCache[name]
+	kallSymsLocker.Unlock()
+
+	if exist {
 		return name, nil
 	}
 
@@ -146,7 +157,7 @@ const defaultSymFile = "/proc/kallsyms"
 // for older syscall functions to run on newer kernels
 func getSyscallName(name string, symFile string) (string, error) {
 	// Get kernel symbols
-	syms, err := ioutil.ReadFile(symFile)
+	syms, err := os.ReadFile(symFile)
 	if err != nil {
 		return "", err
 	}
@@ -206,15 +217,15 @@ var safeEventRegexp = regexp.MustCompile("[^a-zA-Z0-9]")
 func GenerateEventName(probeType, funcName, UID string, attachPID int) (string, error) {
 	// truncate the function name and UID name to reduce the length of the event
 	attachPIDstr := strconv.Itoa(attachPID)
-	maxFuncNameLen := (MaxEventNameLen - 3 /* _ */ - len(probeType) - len(UID) - len(attachPIDstr))
-	if maxFuncNameLen < MinFunctionNameLen { /* let's garantee that we have a function name minimum of 10 chars (MinFunctionNameLen) of trow an error */
+	maxFuncNameLen := (maxEventNameLen - 3 /* _ */ - len(probeType) - len(UID) - len(attachPIDstr))
+	if maxFuncNameLen < minFunctionNameLen { /* let's garantee that we have a function name minimum of 10 chars (minFunctionNameLen) of trow an error */
 		dbgFullEventString := safeEventRegexp.ReplaceAllString(fmt.Sprintf("%s_%s_%s_%s", probeType, funcName, UID, attachPIDstr), "_")
-		return "", fmt.Errorf("event name is too long (kernel limit is %d (MAX_EVENT_NAME_LEN)): MinFunctionNameLen %d, len 3, probeType %d, funcName %d, UID %d, attachPIDstr %d ; full event string : '%s'", MaxEventNameLen, MinFunctionNameLen, len(probeType), len(funcName), len(UID), len(attachPIDstr), dbgFullEventString)
+		return "", fmt.Errorf("event name is too long (kernel limit is %d (MAX_EVENT_NAME_LEN)): minFunctionNameLen %d, len 3, probeType %d, funcName %d, UID %d, attachPIDstr %d ; full event string : '%s'", maxEventNameLen, minFunctionNameLen, len(probeType), len(funcName), len(UID), len(attachPIDstr), dbgFullEventString)
 	}
 	eventName := safeEventRegexp.ReplaceAllString(fmt.Sprintf("%s_%.*s_%s_%s", probeType, maxFuncNameLen, funcName, UID, attachPIDstr), "_")
 
-	if len(eventName) > MaxEventNameLen {
-		return "", fmt.Errorf("event name too long (kernel limit MAX_EVENT_NAME_LEN is %d): '%s'", MaxEventNameLen, eventName)
+	if len(eventName) > maxEventNameLen {
+		return "", fmt.Errorf("event name too long (kernel limit MAX_EVENT_NAME_LEN is %d): '%s'", maxEventNameLen, eventName)
 	}
 	return eventName, nil
 }
@@ -288,4 +299,19 @@ func FindSymbolOffsets(path string, pattern *regexp.Regexp) ([]elf.Symbol, error
 
 	SanitizeUprobeAddresses(f, matches)
 	return matches, nil
+}
+
+func generateTCFilterName(UID, sectionName string, attachPID int) (string, error) {
+	attachPIDstr := strconv.Itoa(attachPID)
+	maxSectionNameLen := maxBPFClassifierNameLen - 3 /* _ */ - len(UID) - len(attachPIDstr)
+	if maxSectionNameLen < 0 {
+		dbgFullFilterString := safeEventRegexp.ReplaceAllString(fmt.Sprintf("%s_%s_%s", sectionName, UID, attachPIDstr), "_")
+		return "", fmt.Errorf("filter name is too long (kernel limit is %d (CLS_BPF_NAME_LEN)): sectionName %d, UID %d, attachPIDstr %d ; full event string : '%s'", maxEventNameLen, len(sectionName), len(UID), len(attachPIDstr), dbgFullFilterString)
+	}
+	filterName := safeEventRegexp.ReplaceAllString(fmt.Sprintf("%.*s_%s_%s", maxSectionNameLen, sectionName, UID, attachPIDstr), "_")
+
+	if len(filterName) > maxBPFClassifierNameLen {
+		return "", fmt.Errorf("filter name too long (kernel limit CLS_BPF_NAME_LEN is %d): '%s'", maxBPFClassifierNameLen, filterName)
+	}
+	return filterName, nil
 }

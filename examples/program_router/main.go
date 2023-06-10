@@ -3,7 +3,8 @@ package main
 import (
 	"github.com/sirupsen/logrus"
 
-	"github.com/ehids/ebpfmanager"
+	"github.com/gojue/ebpfmanager"
+	_ "github.com/shuLhan/go-bindata"
 )
 
 var m = &manager.Manager{

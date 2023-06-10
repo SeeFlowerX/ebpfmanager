@@ -39,13 +39,30 @@ const (
 	XdpAttachModeDrv XdpAttachMode = 1 << 2
 	// XdpAttachModeHw suitable for NICs with hardware XDP support
 	XdpAttachModeHw XdpAttachMode = 1 << 3
+	// DefaultTCFilterPriority is the default TC filter priority if none were given
+	DefaultTCFilterPriority = 50
 )
 
-type TrafficType uint32
+type TrafficType uint16
+
+func (tt TrafficType) String() string {
+	switch tt {
+	case Ingress:
+		return "ingress"
+	case Egress:
+		return "egress"
+	default:
+		return fmt.Sprintf("TrafficType(%d)", tt)
+	}
+}
 
 const (
-	Ingress = TrafficType(tc.HandleMinIngress)
-	Egress  = TrafficType(tc.HandleMinEgress)
+	Ingress          = TrafficType(tc.HandleMinIngress)
+	Egress           = TrafficType(tc.HandleMinEgress)
+	clsactQdisc      = uint16(netlink.HANDLE_INGRESS >> 16)
+	UnknownProbeType = ""
+	ProbeType        = "p"
+	RetProbeType     = "r"
 )
 
 type ProbeIdentificationPair struct {
@@ -69,7 +86,10 @@ type Probe struct {
 	manager            *Manager
 	program            *ebpf.Program
 	programSpec        *ebpf.ProgramSpec
+	attachPID          int
 	link               link.Link
+	tcFilter           netlink.BpfFilter
+	tcClsActQdisc      netlink.Qdisc
 	state              state
 	stateLock          sync.RWMutex
 	manualLoadNeeded   bool
@@ -77,6 +97,19 @@ type Probe struct {
 	funcName           string //目标hook对象的函数名；uprobe中，若为空，则使用offset。
 	AttachPID          int    // pid to attach, only for uprobe .
 	attachRetryAttempt uint
+
+	// TCFilterHandle - (TC classifier) defines the handle to use when loading the classifier. Leave unset to let the kernel decide which handle to use.
+	TCFilterHandle uint32
+
+	// TCFilterPrio - (TC classifier) defines the priority of the classifier added to the clsact qdisc. Defaults to DefaultTCFilterPriority.
+	TCFilterPrio uint16
+
+	// TCCleanupQDisc - (TC classifier) defines if the manager should cleanup the clsact qdisc when a probe is unloaded
+	TCCleanupQDisc bool
+
+	// TCFilterProtocol - (TC classifier) defines the protocol to match in order to trigger the classifier. Defaults to
+	// ETH_P_ALL.
+	TCFilterProtocol uint16
 
 	// lastError - stores the last error that the probe encountered, it is used to surface a more useful error message
 	// when one of the validators (see Options.ActivatedProbes) fails.
@@ -126,10 +159,15 @@ type Probe struct {
 	// enabled, this is max(10, 2*NR_CPUS); otherwise, it is NR_CPUS. For kprobes, maxactive is ignored.
 	KProbeMaxActive int
 
-	// UprobeOffset - If UprobeOffset is provided, the uprobe will be attached to it directly without looking for the
-	// symbol in the elf binary. If the file is a non-PIE executable, the provided address must be a virtual address,
-	// otherwise it must be an offset relative to the file load address.
+	// UprobeOffset - this field changed from being an absolute offset to being relative to Address.
+	//	Now, It's a relative value
 	UprobeOffset uint64
+
+	// UAddress Symbol address. Must be provided in case of external symbols (shared libs).
+	// same as UprobeOptions.Address in cilium/ebpf
+	// offset的含义变为相对偏移量，会自动跟symbol name的地址相加，作为真正hook的地址。
+	// address参数也就是不需要类库再计算的绝对地址，即等于上面二者只和。 优先级最高。
+	UAddress uint64
 
 	// ProbeRetry - Defines the number of times that the probe will retry to attach / detach on error.
 	ProbeRetry uint
@@ -342,24 +380,16 @@ func (p *Probe) init() error {
 	}
 
 	// Find function name match if required
-	var kProbe = false
 	if strings.HasPrefix(p.Section, "kretprobe/") || (strings.HasPrefix(p.Section, "kprobe/")) {
-		var err error
-		p.funcName, err = FindFilterFunction(p.Section)
-		if err != nil {
-			p.lastError = err
-			return err
-		}
-		kProbe = true
-	}
-
-	if kProbe {
 		// Update syscall function name with the correct arch prefix
-		var err error
 		p.funcName, err = GetSyscallFnNameWithSymFile(p.AttachToFuncName, p.manager.options.SymFile)
 		if err != nil {
 			p.lastError = err
-			return err
+			p.funcName, err = FindFilterFunction(p.Section)
+			if err != nil {
+				p.lastError = err
+				return err
+			}
 		}
 	}
 
@@ -446,7 +476,7 @@ func (p *Probe) attach() error {
 		err = p.attachKprobe()
 	case ebpf.TracePoint:
 		err = p.attachTracepoint()
-	case ebpf.CGroupDevice, ebpf.CGroupSKB, ebpf.CGroupSock, ebpf.CGroupSockAddr, ebpf.CGroupSockopt, ebpf.CGroupSysctl:
+	case ebpf.CGroupDevice, ebpf.CGroupSKB, ebpf.CGroupSock, ebpf.SockOps, ebpf.CGroupSockAddr, ebpf.CGroupSockopt, ebpf.CGroupSysctl:
 		err = p.attachCGroup()
 	case ebpf.SocketFilter:
 		err = p.attachSocket()
@@ -612,9 +642,9 @@ func (p *Probe) attachKprobe() error {
 // attachTracepoint - Attaches the probe to its tracepoint
 func (p *Probe) attachTracepoint() error {
 	// Parse section
-	traceGroup := strings.SplitN(p.Section, "/", 3)
+	traceGroup := strings.SplitN(p.programSpec.SectionName, "/", 3)
 	if len(traceGroup) != 3 {
-		return fmt.Errorf("error:%v, expected SEC(\"tracepoint/[category]/[name]\") got %s", ErrSectionFormat, p.Section)
+		return fmt.Errorf("error:%v, expected SEC(\"tracepoint/[category]/[name]\") got %s", ErrSectionFormat, p.programSpec.SectionName)
 	}
 	category := traceGroup[1]
 	name := traceGroup[2]
@@ -651,7 +681,8 @@ func (p *Probe) attachUprobe() error {
 	}
 	// cilium/ebpf最新版中应当使用Address
 	opts := &link.UprobeOptions{
-		Address: p.UprobeOffset,
+		Offset:  p.UprobeOffset,
+		Address: p.UAddress,
 		PID:     p.AttachPID,
 	}
 
@@ -662,7 +693,7 @@ func (p *Probe) attachUprobe() error {
 		kp, err = ex.Uprobe(p.funcName, p.program, opts)
 	}
 	if err != nil {
-		return fmt.Errorf("opening uprobe: %s , isRet:%t", err, isRet)
+		return fmt.Errorf("opening uprobe: %s , isRet:%t, opts:%v", err, isRet, opts)
 	}
 	p.link = kp
 	return nil
@@ -670,15 +701,18 @@ func (p *Probe) attachUprobe() error {
 
 // attachCGroup - Attaches the probe to a cgroup hook point
 func (p *Probe) attachCGroup() error {
+	if p.CGroupPath == "" {
+		return errors.New("CGroupPath cant be empty.")
+	}
 
 	opts := link.CgroupOptions{
 		Path:    p.CGroupPath,
-		Attach:  ebpf.AttachCGroupInetEgress,
+		Attach:  p.programSpec.AttachType,
 		Program: p.program,
 	}
 	kp, err := link.AttachCgroup(opts)
 	if err != nil {
-		return errors.New(fmt.Sprintf("error:%v , failed to attach probe %v to cgroup %s", err, p.GetIdentificationPair(), p.CGroupPath))
+		return errors.New(fmt.Sprintf("error:%v , failed to attach probe %v to cgroup %s, attach type:%s", err, p.GetIdentificationPair(), p.CGroupPath, p.programSpec.AttachType.String()))
 	}
 
 	p.link = kp
@@ -693,6 +727,45 @@ func (p *Probe) attachSocket() error {
 // detachSocket - Detaches the probe from its socket
 func (p *Probe) detachSocket() error {
 	return sockDetach(p.SocketFD, p.program.FD())
+}
+
+func (p *Probe) buildTCClsActQdisc() netlink.Qdisc {
+	if p.tcClsActQdisc == nil {
+		p.tcClsActQdisc = &netlink.GenericQdisc{
+			QdiscType: "clsact",
+			QdiscAttrs: netlink.QdiscAttrs{
+				LinkIndex: int(p.Ifindex),
+				Handle:    netlink.MakeHandle(0xffff, 0),
+				Parent:    netlink.HANDLE_INGRESS,
+			},
+		}
+	}
+	return p.tcClsActQdisc
+}
+func (p *Probe) getTCFilterParentHandle() uint32 {
+	return netlink.MakeHandle(clsactQdisc, uint16(p.NetworkDirection))
+}
+func (p *Probe) buildTCFilter() (netlink.BpfFilter, error) {
+	if p.tcFilter.FilterAttrs.LinkIndex == 0 {
+		var filterName string
+		filterName, err := generateTCFilterName(p.UID, p.programSpec.SectionName, p.attachPID)
+		if err != nil {
+			return p.tcFilter, fmt.Errorf("couldn't create TC filter for %v: %w", p.EbpfFuncName, err)
+		}
+		p.tcFilter = netlink.BpfFilter{
+			FilterAttrs: netlink.FilterAttrs{
+				LinkIndex: int(p.Ifindex),
+				Parent:    p.getTCFilterParentHandle(),
+				Handle:    p.TCFilterHandle,
+				Priority:  p.TCFilterPrio,
+				Protocol:  p.TCFilterProtocol,
+			},
+			Fd:           p.program.FD(),
+			Name:         filterName,
+			DirectAction: true,
+		}
+	}
+	return p.tcFilter, nil
 }
 
 // attachTCCLS - Attaches the probe to its TC classifier hook point

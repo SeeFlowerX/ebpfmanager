@@ -7,15 +7,14 @@ import (
 	"github.com/sirupsen/logrus"
 	"os"
 	"strings"
+	"time"
 )
 
 var m = &manager.Manager{
 	Probes: []*manager.Probe{
 		{
-			//Section:      "cgroup_skb/egress",
-			//CGroupPath:   "/sys/fs/cgroup/unified",
-			EbpfFuncName: "cgroup_egress_func",
-			Section:      "cgroup_skb/egress",
+			EbpfFuncName: "bpf_sockops",
+			Section:      "sockops",
 		},
 	},
 }
@@ -27,6 +26,7 @@ func main() {
 	}
 	m.Probes[0].CGroupPath = cp
 
+	logrus.Println("try to attach sockops ebpf programs.")
 	// Initialize the manager
 	if err := m.Init(recoverAssets()); err != nil {
 		logrus.Fatal(err)
@@ -38,7 +38,7 @@ func main() {
 	}
 
 	logrus.Println("successfully started, head over to /sys/kernel/debug/tracing/trace_pipe")
-
+	time.Sleep(time.Second * 3)
 	// Generate some network traffic to trigger the probe
 	trigger()
 
