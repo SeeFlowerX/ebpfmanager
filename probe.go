@@ -474,6 +474,8 @@ func (p *Probe) attach() error {
 		err = fmt.Errorf("error:%v, %s", ErrSectionFormat, "invalid program type, make sure to use the right section prefix")
 	case ebpf.Kprobe:
 		err = p.attachKprobe()
+	case ebpf.PerfEvent:
+		err = p.attachPerfEvent()
 	case ebpf.TracePoint:
 		err = p.attachTracepoint()
 	case ebpf.CGroupDevice, ebpf.CGroupSKB, ebpf.CGroupSock, ebpf.SockOps, ebpf.CGroupSockAddr, ebpf.CGroupSockopt, ebpf.CGroupSysctl:
@@ -634,6 +636,15 @@ func (p *Probe) attachKprobe() error {
 
 	if err != nil {
 		return fmt.Errorf("opening Kprobe: %s, funcName:%s, isRet:%t, section:%s", err, funcName, isRet, p.Section)
+	}
+	p.link = kp
+	return nil
+}
+
+func (p *Probe) attachPerfEvent() error {
+	kp, err := link.PerfEvent(p.program, nil)
+	if err != nil {
+		return errors.New(fmt.Sprintf("error:%v , couldn's activate perf_event %s, matchFuncName:%s", err, p.Section, p.EbpfFuncName))
 	}
 	p.link = kp
 	return nil
