@@ -159,6 +159,9 @@ type Probe struct {
 	// enabled, this is max(10, 2*NR_CPUS); otherwise, it is NR_CPUS. For kprobes, maxactive is ignored.
 	KProbeMaxActive int
 
+	// ELF内嵌在某个文件中的情况下使用
+	NonElfOffset uint64
+
 	// UprobeOffset - this field changed from being an absolute offset to being relative to Address.
 	//	Now, It's a relative value
 	UprobeOffset uint64
@@ -174,6 +177,9 @@ type Probe struct {
 
 	// ProbeRetryDelay - Defines the delay to wait before the probe should retry to attach / detach on error.
 	ProbeRetryDelay time.Duration
+
+	// 用来处理 apk 内嵌 elf 的情况
+	RealFilePath string
 
 	// BinaryPath - (uprobes) A Uprobe is attached to a specific symbol in a user space binary. The offset is
 	// automatically computed for the symbol name provided in the uprobe section ( SEC("uprobe/[symbol_name]") ).
@@ -692,11 +698,11 @@ func (p *Probe) attachUprobe() error {
 	}
 	// cilium/ebpf最新版中应当使用Address
 	opts := &link.UprobeOptions{
-		Offset:  p.UprobeOffset,
-		Address: p.UAddress,
-		PID:     p.AttachPID,
+		RealFilePath: p.RealFilePath,
+		Offset:       p.UprobeOffset + p.NonElfOffset,
+		Address:      p.UAddress,
+		PID:          p.AttachPID,
 	}
-
 	var kp link.Link
 	if isRet {
 		kp, err = ex.Uretprobe(p.funcName, p.program, opts)
